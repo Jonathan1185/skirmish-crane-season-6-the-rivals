@@ -68,16 +68,32 @@ class Agent:
                 self.policy_error = error
 
     def reset(self, seed: int, observation: SkirmishObservation) -> None:
-        """Called once before a match; this hybrid agent has no episode state."""
+        """Prepare delayed cavalry heartbeats used for role reassignment."""
+        allies = roster.allies(observation)
+        self._player_by_unit = {ally["unit_id"]: ally["player"] for ally in allies}
+        self._own_player = self._player_by_unit[me.unit_id(observation)]
+        self._cavalry_players = {ally["player"] for ally in allies if ally["type"] == "cavalry"}
+        self._cavalry_heartbeats: dict[str, int] = {}
+        self._current_round = observation["observation"]["round"]
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
         """Choose a role-specific, trap-safe movement plan for this unit."""
+        self._current_round = observation["observation"]["round"]
         # Zone coordination takes priority over a unit's normal combat role. It keeps
         # established territory occupied while sending every free unit toward a second
         # uncontested zone (or another objective after a zone becomes overcrowded).
-        role_order = self._zone_order(observation)
+        unit_type = me.unit_type(observation)
+        cavalry_lost = self._all_cavalry_confirmed_lost()
+        if unit_type == "archer" and cavalry_lost:
+            # With no cavalry screen, archers do not abandon their ranged pressure to
+            # reinforce zones; they keep their distance and attack visible enemies.
+            role_order = self._archer_order(observation)
+        elif unit_type == "footman" and cavalry_lost:
+            # Footmen inherit the cavalry's objective job after its heartbeat stops.
+            role_order = self._footman_capture_order(observation)
+        else:
+            role_order = self._zone_order(observation)
         if role_order is None:
-            unit_type = me.unit_type(observation)
             if unit_type == "archer":
                 role_order = self._archer_order(observation)
             elif unit_type == "cavalry":
@@ -93,6 +109,32 @@ class Agent:
                 self.model = None
                 self.policy_error = error
         return role_order
+
+    def _all_cavalry_confirmed_lost(self) -> bool:
+        """Treat cavalry as lost only after every known cavalry heartbeat expires."""
+        # An unseen cavalry unit may simply be flanking. Require it to have sent at
+        # least one chat heartbeat before its absence can trigger role reassignment.
+        if not self._cavalry_players or set(self._cavalry_heartbeats) != self._cavalry_players:
+            return False
+        return all(
+            reported_round < self._current_round - 3
+            for reported_round in self._cavalry_heartbeats.values()
+        )
+
+    def _footman_capture_order(self, observation: SkirmishObservation) -> SkirmishAction:
+        """Use the surviving footman's durability to keep expanding zone control."""
+        coordinated = self._zone_order(observation)
+        if coordinated is not None:
+            return coordinated
+        areas = zone.zones(observation)
+        here = me.position(observation)
+        target_id = self._nearest_enemy_id(observation)
+        if areas:
+            if zone.at(observation, here) is not None:
+                return action.stay(target_id, observation) if target_id else action.stay()
+            goal = min(areas, key=lambda area: tile.distance(here, area["center"]))["center"]
+            return self._move_toward(observation, goal, target_id)
+        return self._footman_order(observation)
 
     def _zone_order(self, observation: SkirmishObservation) -> SkirmishAction | None:
         """Coordinate captures: hold crowded ground and maintain two safe zones when possible."""
@@ -343,3 +385,25 @@ class Agent:
             if ground["terrain"] == "trap" or ground["feature"] in self.TRAP_FEATURES:
                 return False
         return True
+
+    def chat(self, inbox: list[dict]) -> list[dict] | None:
+        """Broadcast cavalry heartbeats so footmen can take over after a confirmed loss."""
+        for message in inbox:
+            sender = message.get("from")
+            text = message.get("text")
+            if sender not in self._cavalry_players or not isinstance(text, str):
+                continue
+            prefix, separator, round_text = text.partition(":")
+            if prefix != "crane-cavalry-alive" or not separator:
+                continue
+            try:
+                reported_round = int(round_text)
+            except ValueError:
+                continue
+            self._cavalry_heartbeats[sender] = max(
+                self._cavalry_heartbeats.get(sender, 0), reported_round
+            )
+
+        if self._own_player in self._cavalry_players:
+            return [{"to": None, "text": f"crane-cavalry-alive:{self._current_round}"}]
+        return None
