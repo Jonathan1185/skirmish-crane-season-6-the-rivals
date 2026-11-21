@@ -1,97 +1,153 @@
-"""A working Crane starter agent.
+"""Hybrid Crane agent with an optional trained-policy upgrade.
 
-Each unit runs a separate instance of this class. This starter walks forward until it sees an
-enemy, then takes one legal step toward the nearest visible enemy and names it. Start at the
-``TODO(you)`` comments.
-Read ``environment.md`` beside this file for the rules, helpers, and first improvement. Prepare
-episode state in ``reset``. The constructor takes no arguments.
+The reliable baseline always remains available: it advances toward the enemy side,
+then takes the legal one-step move that best closes on the nearest visible enemy.
+When ``torch``, ``encoder.py``, ``imitation_model.py``, and
+``imitation-policy.pt`` are supplied beside this file, the same agent instead lets
+the supplied PyTorch policy choose a reachable destination and legal target.
 """
 
-from sandbox.crane import action, me, tile, visible
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from sandbox.crane import action, me, paths, tile, visible
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation
 
 
-class Agent:
-    """Marches toward the enemy side, then steps toward the nearest visible enemy."""
+# The copied trained-policy agent relies on these project artifacts, which are not
+# part of this repository yet. Keep the submission importable until they are added.
+try:
+    import torch
 
-    def reset(self, seed, observation) -> None:
-        # Called once before each match. The opening observation is available here for
-        # precomputation outside the decision clock. This starter stores no state.
-        pass
+    from encoder import (
+        describe_move,
+        describe_target,
+        encode_entities,
+        move_options,
+        target_entity_indices,
+        target_options,
+    )
+    from imitation_model import load_policy
+
+    _POLICY_IMPORT_ERROR: Exception | None = None
+    _POLICY_READY = True
+except (ImportError, OSError) as error:
+    torch = None  # type: ignore[assignment]
+    _POLICY_IMPORT_ERROR = error
+    _POLICY_READY = False
+
+
+def _option_tensor(rows: list[list[float]]) -> Any:
+    """Add the batch dimension expected by the copied policy network."""
+    if torch is None:  # Defensive: this function is only used with a loaded policy.
+        raise RuntimeError("The trained-policy dependencies are unavailable")
+    return torch.tensor(rows, dtype=torch.float32).unsqueeze(0)
+
+
+class Agent:
+    """Use the trained policy when present, otherwise play a safe starter strategy."""
+
+    # ``waste`` is the hazardous, damaging feature in the current Crane rules.  Including
+    # ``trap`` also keeps the strategy safe if a map uses that more direct feature name.
+    TRAP_FEATURES = frozenset({"trap", "waste"})
+
+    def __init__(self) -> None:
+        self.model: Any | None = None
+        self.policy_error: Exception | None = _POLICY_IMPORT_ERROR
+        policy_file = Path(__file__).with_name("imitation-policy.pt")
+
+        if _POLICY_READY and policy_file.is_file():
+            try:
+                # The policy agent uses one CPU thread to keep per-turn inference fast.
+                torch.set_num_threads(1)
+                self.model = load_policy(policy_file)
+            except (OSError, RuntimeError, ValueError) as error:
+                # A failed optional model must not make the whole team unable to act.
+                self.policy_error = error
+
+    def reset(self, seed: int, observation: SkirmishObservation) -> None:
+        """Called once before a match; this hybrid agent has no episode state."""
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
-        # The enemies this unit can see.
+        """Choose a trained-policy order when possible, with a legal tactical fallback."""
+        if self.model is not None:
+            try:
+                return self._policy_action(observation)
+            except (RuntimeError, ValueError, KeyError, IndexError, TypeError) as error:
+                # If a model/checkpoint is incompatible with the match schema, retain
+                # a valid move for this turn and disable repeated failing inferences.
+                self.model = None
+                self.policy_error = error
+
+        return self._starter_action(observation)
+
+    def _policy_action(self, observation: SkirmishObservation) -> SkirmishAction:
+        """The destination-and-target inference from the supplied PyTorch agent."""
+        if torch is None or self.model is None:
+            raise RuntimeError("No trained policy is loaded")
+
+        entities, enemy_indices = encode_entities(observation)
+        entity_mask = torch.ones((1, len(entities)), dtype=torch.bool)
+        context = self.model.encode(_option_tensor(entities), entity_mask)
+
+        # A trap is legal to enter according to the engine's action mask, but every role
+        # treats it as strategically impassable. Filter full paths, not just endpoints,
+        # so cavalry cannot cross one on the way to an otherwise safe destination.
+        moves = [move for move in move_options(observation) if self._path_avoids_traps(observation, move[0])]
+        targets = target_options(observation)
+        if not moves or not targets:
+            raise ValueError("The observation must contain legal movement and target options")
+
+        move_rows = _option_tensor([describe_move(observation, end) for _, end in moves])
+        move_mask = torch.ones((1, len(moves)), dtype=torch.bool)
+        move_scores = self.model.score_moves(context, entity_mask, move_rows, move_mask)
+        path, end = moves[int(move_scores[0].argmax())]
+
+        target_rows = _option_tensor(
+            [describe_target(observation, end, target) for target in targets]
+        )
+        pointers = torch.tensor([target_entity_indices(observation, targets, enemy_indices)])
+        target_mask = torch.ones((1, len(targets)), dtype=torch.bool)
+        target_scores = self.model.score_targets(context, target_rows, pointers, target_mask)
+        return {"path": path, "target": targets[int(target_scores[0].argmax())]}
+
+    def _starter_action(self, observation: SkirmishObservation) -> SkirmishAction:
+        """Original starter behavior, retained as the dependency-free fallback."""
         enemies = visible.enemies(observation)
-
         if not enemies:
-            # At the beginning of a default skirmish match, units sit apart and see no enemies.
-            # me.direction is the digit toward the enemy side, so this unit heads that way.
             forward = me.direction(observation)
-
-            # legal_steps lists the single steps allowed by the mask. Checking membership keeps
-            # this order legal when a wall, ally, or enemy blocks the way.
-            if forward in action.legal_steps(observation):
+            if forward in action.legal_steps(observation) and self._path_avoids_traps(observation, forward):
                 return action.move(forward)
-
-            # TODO(you): this unit stands still when something blocks the way.
-            # It may still attack, but can you choose a better response?
             return action.stay()
 
-        # TODO(you): walking toward the nearest enemy is the entire strategy, and it is weak.
-        # An archer should shoot and back away, cavalry should swing wide for a flank, and a
-        # footman should hold the line beside an ally. What should each of your units do?
-
-        # This unit's current {"q": ..., "r": ...} position.
         here = me.position(observation)
-
-        # The closest enemy in sight. min returns the enemy dictionary, not the distance.
         nearest = min(enemies, key=lambda enemy: tile.distance(here, enemy["position"]))
-
-        # The step that gets closest to the enemy, or 0 when no step gets closer.
         step = self._step_toward(observation, nearest["position"])
-
-        # Naming a target makes the strike prefer that enemy. Any visible enemy can be named,
-        # so both orders below are legal.
         if step == 0:
             return action.stay(nearest["unit_id"], observation)
         return action.move(step, nearest["unit_id"], observation)
 
     def _step_toward(self, observation: SkirmishObservation, goal: AxialPosition) -> int:
-        """Return the single step that most closes the gap to goal, or 0 when none does."""
-        # TODO(you): only single steps are tried here. A path can contain four steps, and cavalry
-        # has four movement points, so most of that speed goes to waste.
+        """Return the legal single step that most closes the gap to ``goal``."""
         here = me.position(observation)
-
-        # Standing still is path id 0. A step must reduce the distance to be worth taking.
         best_step = 0
         best_distance = tile.distance(here, goal)
-
         for step in action.legal_steps(observation):
-            # at_path_end gives the landing tile, so this is the distance after the step.
+            if not self._path_avoids_traps(observation, step):
+                continue
             step_distance = tile.distance(tile.at_path_end(here, step), goal)
-
-            # Remember this step if it is the best one so far.
             if step_distance < best_distance:
                 best_step, best_distance = step, step_distance
-
         return best_step
 
-    # Optional: a reinforcement-learning hook called after every step with that step's
-    # transition. Its time counts against the timing and episode budget. The order argument is
-    # what act returned. It is named order so it does not shadow the action helpers.
-    #
-    # def learn(self, observation, order: SkirmishAction, reward: float, terminated: bool) -> None:
-    #     ...
-
-    # Optional: messaging. Season settings enable it from Season 3 onward. When enabled, chat runs
-    # after a unit chooses its order and receives messages that arrived since its previous
-    # activation. Return each message with a recipient and text. Use None to broadcast to both
-    # sides, or a player id such as "player_2", not a unit id, to send directly to one ally. The
-    # rosters in the observation map each player to its unit. By default, text is limited to 200
-    # characters.
-    # A direct message reaches its allied unit at its next activation, after that unit chooses its
-    # own order. Every message is recorded and shown in replays, so nothing you send is ever secret.
-    # Return nothing to stay silent.
-    #
-    # def chat(self, inbox: list[dict]) -> list[dict] | None:
-    #     ...
+    def _path_avoids_traps(self, observation: SkirmishObservation, path_id: int) -> bool:
+        """Return whether every tile entered along a legal path is non-hazardous."""
+        position = me.position(observation)
+        for direction in paths.decode(path_id):
+            position = tile.at_path_end(position, direction)
+            ground = tile.terrain_at(observation, position)
+            if ground["terrain"] == "trap" or ground["feature"] in self.TRAP_FEATURES:
+                return False
+        return True

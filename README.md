@@ -42,3 +42,9 @@ Test the connection with:
 ```console
 python -m sandbox llm
 ```
+
+##Design Goal: My design goal was similar to my previous attempts of making my units more well versed with the following enviorment. I made it so the archers, footmen and calvery try to avoid the traps and capture at least two zones at all times. Additionally I assigned a role to each of the units (archers, footmen and calvery). The calvery charge into the zone while archer attack from a far a footmen defend.
+
+##Short Reflection: I also wanted the capture area to play a major part of it so I made the calvary job to capture it then the footmen then the archers. Additionally the different roles try to capture a different capture zone.
+
+#AI Disclosure and reflection: I used a AI agent (Codex) for my agent to help with the unit behavior.
