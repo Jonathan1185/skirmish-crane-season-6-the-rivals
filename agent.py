@@ -84,7 +84,12 @@ class Agent:
         # uncontested zone (or another objective after a zone becomes overcrowded).
         unit_type = me.unit_type(observation)
         cavalry_lost = self._all_cavalry_confirmed_lost()
-        if unit_type == "archer" and cavalry_lost:
+        priority_target = self._cavalry_archer_in_range(observation) if unit_type == "cavalry" else None
+        if priority_target is not None:
+            # A cavalry strike can remove a fragile archer immediately. Do not let zone
+            # movement or the optional target model replace that guaranteed priority.
+            role_order = action.stay(priority_target, observation)
+        elif unit_type == "archer" and cavalry_lost:
             # With no cavalry screen, archers do not abandon their ranged pressure to
             # reinforce zones; they keep their distance and attack visible enemies.
             role_order = self._archer_order(observation)
@@ -101,7 +106,7 @@ class Agent:
             else:
                 role_order = self._footman_order(observation)
 
-        if self.model is not None:
+        if self.model is not None and priority_target is None:
             try:
                 return self._policy_target_for_path(observation, role_order["path"])
             except (RuntimeError, ValueError, KeyError, IndexError, TypeError) as error:
@@ -109,6 +114,21 @@ class Agent:
                 self.model = None
                 self.policy_error = error
         return role_order
+
+    @staticmethod
+    def _cavalry_archer_in_range(observation: SkirmishObservation) -> str | None:
+        """Return the weakest visible archer cavalry can strike without moving."""
+        here = me.position(observation)
+        attack_range = units.STATS["cavalry"].attack_range
+        targets = [
+            enemy
+            for enemy in visible.enemies(observation)
+            if enemy["type"] == "archer"
+            and tile.distance(here, enemy["position"]) <= attack_range
+        ]
+        if not targets:
+            return None
+        return min(targets, key=lambda enemy: (enemy["hit_points"], enemy["unit_id"]))["unit_id"]
 
     def _all_cavalry_confirmed_lost(self) -> bool:
         """Treat cavalry as lost only after every known cavalry heartbeat expires."""
