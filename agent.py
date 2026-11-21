@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from sandbox.crane import action, me, paths, tile, units, visible, zone
+from sandbox.crane import action, me, paths, roster, tile, units, visible, zone
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation
 
 
@@ -50,6 +50,8 @@ class Agent:
     # ``waste`` is the hazardous, damaging feature in the current Crane rules.  Including
     # ``trap`` also keeps the strategy safe if a map uses that more direct feature name.
     TRAP_FEATURES = frozenset({"trap", "waste"})
+    DEFENDER_CAPACITY = 3
+    MIN_HELD_ZONES = 2
 
     def __init__(self) -> None:
         self.model: Any | None = None
@@ -70,13 +72,18 @@ class Agent:
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
         """Choose a role-specific, trap-safe movement plan for this unit."""
-        unit_type = me.unit_type(observation)
-        if unit_type == "archer":
-            role_order = self._archer_order(observation)
-        elif unit_type == "cavalry":
-            role_order = self._cavalry_order(observation)
-        else:
-            role_order = self._footman_order(observation)
+        # Zone coordination takes priority over a unit's normal combat role. It keeps
+        # established territory occupied while sending every free unit toward a second
+        # uncontested zone (or another objective after a zone becomes overcrowded).
+        role_order = self._zone_order(observation)
+        if role_order is None:
+            unit_type = me.unit_type(observation)
+            if unit_type == "archer":
+                role_order = self._archer_order(observation)
+            elif unit_type == "cavalry":
+                role_order = self._cavalry_order(observation)
+            else:
+                role_order = self._footman_order(observation)
 
         if self.model is not None:
             try:
@@ -86,6 +93,76 @@ class Agent:
                 self.model = None
                 self.policy_error = error
         return role_order
+
+    def _zone_order(self, observation: SkirmishObservation) -> SkirmishAction | None:
+        """Coordinate captures: hold crowded ground and maintain two safe zones when possible."""
+        areas = zone.zones(observation)
+        if not areas:
+            return None
+
+        own_side = me.side(observation)
+        here = me.position(observation)
+        current = zone.at(observation, here)
+        current_index = next((index for index, area in enumerate(areas) if area == current), None)
+        occupants = [zone.occupants(observation, area) for area in areas]
+        crowded = {
+            index for index, units_in_zone in enumerate(occupants)
+            if len(units_in_zone) > self.DEFENDER_CAPACITY
+        }
+        held = {
+            index
+            for index, units_in_zone in enumerate(occupants)
+            if any(unit["side"] == own_side for unit in units_in_zone)
+            and not any(unit["side"] != own_side for unit in units_in_zone)
+        }
+        target_id = self._nearest_enemy_id(observation)
+
+        # Four or more occupants is sufficient coverage. Units already there stay,
+        # defend, and attack instead of attracting still more allies to that zone.
+        if current_index in crowded:
+            return action.stay(target_id, observation) if target_id else action.stay()
+
+        required = min(self.MIN_HELD_ZONES, len(areas))
+        if current_index in held:
+            # Do not abandon a zone that is already scoring while teammates establish
+            # the next one. This gives the team a stable first zone on its way to two.
+            return action.stay(target_id, observation) if target_id else action.stay()
+
+        must_expand = len(held) < required
+        if not must_expand and not crowded:
+            return None
+
+        # Prefer zones not yet held. Once any zone is crowded, every unit outside it
+        # is directed to another non-crowded zone rather than reinforcing the stack.
+        candidates = [
+            index for index in range(len(areas)) if index not in crowded and index not in held
+        ]
+        if not candidates and must_expand:
+            candidates = [index for index in range(len(areas)) if index not in crowded]
+        if not candidates:
+            return None
+
+        ranked = sorted(candidates, key=lambda index: tile.distance(here, areas[index]["center"]))
+        missing_zones = max(1, required - len(held))
+        if must_expand and len(ranked) > 1:
+            # Units cannot see every teammate, so use roster order as a stable tie-breaker:
+            # different units fan out across the needed zones instead of all choosing one.
+            ally_ids = [ally["unit_id"] for ally in roster.allies(observation)]
+            unit_slot = ally_ids.index(me.unit_id(observation)) if me.unit_id(observation) in ally_ids else 0
+            destination = ranked[unit_slot % min(missing_zones, len(ranked))]
+        else:
+            destination = ranked[0]
+        if destination == current_index:
+            return action.stay(target_id, observation) if target_id else action.stay()
+        return self._move_toward(observation, areas[destination]["center"], target_id)
+
+    @staticmethod
+    def _nearest_enemy_id(observation: SkirmishObservation) -> str | None:
+        enemies = visible.enemies(observation)
+        if not enemies:
+            return None
+        here = me.position(observation)
+        return min(enemies, key=lambda enemy: tile.distance(here, enemy["position"]))["unit_id"]
 
     def _policy_target_for_path(self, observation: SkirmishObservation, path_id: int) -> SkirmishAction:
         """Let the optional model name a target for a role-selected destination."""
